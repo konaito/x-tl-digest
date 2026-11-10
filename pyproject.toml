@@ -1,0 +1,9 @@
+[project]
+name = "x-tl-digest"
+version = "0.1.0"
+description = "A tech-trend newsletter from your X timeline, written for both humans and AI agents."
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "twifork[impersonate]>=2.4.0",
+]

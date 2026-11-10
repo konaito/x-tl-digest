@@ -1,0 +1,68 @@
+# x-tl-digest の設定。config.toml に写して書き換える（config.toml は git に入れない）。
+# 判定基準やしきい値もここで調整する。
+
+# Keychain の項目のアカウント名。省くとログインユーザー名を使う。
+# keychain_account = ""
+
+[fetch]
+# おすすめTLを何ページ取るか。1ページはおよそ20件。
+pages = 5
+count = 20
+page_interval_sec = 3
+# curl_cffi でブラウザの TLS 指紋を使う。X が httpx の指紋を 403 で弾くことがあるため。
+impersonate = "chrome124"
+
+[clef]
+model = "@cf/cloudflare/clef"
+# Workers AI を使う Cloudflare のアカウントID。空なら cf CLI の既定のアカウントを使う。
+account_id = ""
+concurrency = 8
+# is_tech と worth の両方がしきい値以上なら要約の候補にする。
+threshold_tech = 0.5
+threshold_worth = 0.5
+
+# Clef は英語の指示のほうが安定するので、指示は英語で書き、日本語の手がかり語は criteria に入れる。
+[clef.questions.is_tech]
+type = "noul"
+instructions = "Is this post mainly about technology: software development, AI/LLMs, developer tools, cloud/infrastructure, security, hardware, or tech products and companies?"
+
+[clef.questions.worth]
+type = "noul"
+instructions = "The reader is an indie developer and startup founder in Japan who ships web and mobile apps (Next.js, Cloudflare Workers, Supabase, iOS/Android), mostly through AI coding agents such as Claude Code and Codex, and builds LLM-powered products. Should this reader understand what this post is about, because it reports a concrete new release, a notable change, an emerging technique or tool, a security incident, or a technology trend many developers are discussing?"
+
+[clef.questions.worth.criteria]
+true = "A concrete release, update, technique, tool, incident, or widely discussed tech trend (新リリース, 発表, 公開, アップデート, 登場, 脆弱性, 話題)"
+false = "Personal chatter, jokes, memes, ads, giveaways, politics, entertainment, generic career or productivity advice, or vague opinions without concrete tech content"
+
+[clef.questions.importance]
+type = "score"
+instructions = "How important is this for the reader above to understand?"
+criteria = [
+  "Not relevant",
+  "Minor or niche",
+  "Useful to know",
+  "Important: likely to affect tools, products, or decisions the reader works with",
+]
+
+[summary]
+# 空なら claude の既定モデルを使う。
+model = ""
+max_candidates = 60
+max_trends = 8
+# これより前に取得した候補は送らない。
+lookback_hours = 36
+# 読み手の説明。要約とAIの所感はこの読み手に向けて書かれる。自分に合わせて書き換える。
+profile = "日本のインディー開発者・スタートアップ創業者。Next.js、Cloudflare Workers、Supabase、iOS/Android でアプリを作り、開発の大半を Claude Code や Codex などのAIコーディングエージェントで進め、LLMを使ったプロダクトを作っている。"
+
+[mail]
+# Discord と同じ内容をメルマガ（HTMLメール）でも送る。送信には gog（gogcli）の Gmail を使う。
+enabled = false
+# account は gog に認証済みの Google アカウント。
+account = "you@example.com"
+# from は省ける。指定するなら、その Gmail で「送信元」に登録済みのアドレスにする。
+# 送信元の表示名にカンマを入れると、gog が From ヘッダを壊し、Gmail が主アドレスに書き換える。
+from = ""
+to = ["agent@example.com"]
+# true なら、gog のトークンを暗号化ファイルに置き、その鍵を Keychain の x-tl-digest.gog-keyring から渡す。
+# launchd から動かすとき、gog が Keychain の許可ダイアログで止まらないようにするため。
+gog_file_keyring = true
