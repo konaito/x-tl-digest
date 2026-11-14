@@ -55,14 +55,9 @@ lookback_hours = 36
 profile = "日本のインディー開発者・スタートアップ創業者。Next.js、Cloudflare Workers、Supabase、iOS/Android でアプリを作り、開発の大半を Claude Code や Codex などのAIコーディングエージェントで進め、LLMを使ったプロダクトを作っている。"
 
 [mail]
-# Discord と同じ内容をメルマガ（HTMLメール）でも送る。送信には gog（gogcli）の Gmail を使う。
+# Discord と同じ内容をメルマガ（HTMLメール）でも送る。送信は Google Apps Script の Web アプリ（メール送信 API）に POST する。
+# API の URL と token は Keychain に入れる（README の「メールを送る」）。送信元は API 側で固定され、宛先も API 側が許可したものだけ通る。
 enabled = false
-# account は gog に認証済みの Google アカウント。
-account = "you@example.com"
-# from は省ける。指定するなら、その Gmail で「送信元」に登録済みのアドレスにする。
-# 送信元の表示名にカンマを入れると、gog が From ヘッダを壊し、Gmail が主アドレスに書き換える。
-from = ""
 to = ["agent@example.com"]
-# true なら、gog のトークンを暗号化ファイルに置き、その鍵を Keychain の x-tl-digest.gog-keyring から渡す。
-# launchd から動かすとき、gog が Keychain の許可ダイアログで止まらないようにするため。
-gog_file_keyring = true
+# 送信元の表示名。省けば API の既定になる。
+# name = ""
