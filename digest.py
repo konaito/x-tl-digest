@@ -11,7 +11,6 @@ import os
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import tomllib
 import traceback
@@ -28,9 +27,9 @@ DB_PATH = ROOT / "data" / "digest.sqlite"
 JST = timezone(timedelta(hours=9))
 COOKIE_SERVICE = "x-tl-digest.x-cookies"
 WEBHOOK_SERVICE = "x-tl-digest.discord-webhook"
-# gog のトークンは暗号化ファイルに置き、その鍵だけを Keychain に入れる。gog が Keychain を直接使うと、
-# launchd から動かしたときにアクセス許可ダイアログで止まるため。
-GOG_KEYRING_SERVICE = "x-tl-digest.gog-keyring"
+# メール送信 API（Google Apps Script の Web アプリ）の URL と token。リポジトリは公開なので値は Keychain にだけ置く。
+MAIL_URL_SERVICE = "claudecode-mail-proxy.url"
+MAIL_TOKEN_SERVICE = "claudecode-mail-proxy.token"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tweets (
@@ -122,10 +121,22 @@ def now_iso() -> str:
 KEYCHAIN_ACCOUNT = os.environ.get("USER", "")
 
 
+def retry(fn, attempts: int = 3, delay: float = 5.0):
+    """fn を最大 attempts 回試す。失敗の間は delay 秒空ける。最後の失敗はそのまま投げる。"""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if i == attempts - 1:
+                raise
+            log(f"リトライ {i + 1}/{attempts - 1}: {one_line(str(e), 120)}")
+            time.sleep(delay)
+
+
 def keychain_get(service: str) -> str:
-    return subprocess.check_output(
+    return retry(lambda: subprocess.check_output(
         ["security", "find-generic-password", "-s", service, "-a", KEYCHAIN_ACCOUNT, "-w"], text=True
-    ).strip()
+    ).strip())
 
 
 def keychain_set(service: str, value: str) -> None:
@@ -507,22 +518,63 @@ def build_email(trends: list[dict], rows: dict[str, sqlite3.Row], stats_line: st
     return subject, "\n".join(text_parts), body_html
 
 
+def _send_email_once(mail_cfg: dict, subject: str, body_text: str, body_html: str) -> str:
+    """メール送信 API に POST する。成功は {"ok": true, ...}。JSON でない応答や ok が真でない応答は失敗にする。"""
+    payload = {"token": keychain_get(MAIL_TOKEN_SERVICE), "to": ",".join(mail_cfg["to"]),
+               "subject": subject, "html": body_html, "text": body_text}
+    if mail_cfg.get("name"):
+        payload["name"] = mail_cfg["name"]
+    req = urllib.request.Request(
+        keychain_get(MAIL_URL_SERVICE), data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    # GAS は 302 を挟んで最後に 200 を返す。urllib は 302 を追い、2回目は GET になる（GAS の結果の取得はそれでよい）。
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"メール送信 API が HTTP {e.code}: {one_line(e.read().decode('utf-8', 'replace'), 200)}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"メール送信 API に接続できない: {e.reason}") from None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise RuntimeError(f"メール送信 API が JSON でない応答を返した: {one_line(raw, 200)}") from None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        err = data.get("error") if isinstance(data, dict) else data
+        raise RuntimeError(f"メール送信 API が失敗を返した: {one_line(str(err), 200)}")
+    return f"messageId={data.get('messageId')} from={data.get('from')}"
+
+
 def send_email(mail_cfg: dict, subject: str, body_text: str, body_html: str) -> str:
-    env = dict(os.environ)
-    if mail_cfg.get("gog_file_keyring", True):
-        env |= {"GOG_KEYRING_BACKEND": "file", "GOG_KEYRING_PASSWORD": keychain_get(GOG_KEYRING_SERVICE)}
-    with tempfile.TemporaryDirectory() as d:
-        text_path, html_path = Path(d) / "body.txt", Path(d) / "body.html"
-        text_path.write_text(body_text)
-        html_path.write_text(body_html)
-        cmd = ["gog", "gmail", "send", "--account", mail_cfg["account"], "--to", ",".join(mail_cfg["to"])]
-        if mail_cfg.get("from"):
-            cmd += ["--from", mail_cfg["from"]]
-        cmd += ["--subject", subject, "--body-file", str(text_path), "--body-html-file", str(html_path), "--json"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(f"gog gmail send が終了コード {proc.returncode}: {(proc.stderr or proc.stdout)[-400:]}")
-    return proc.stdout.strip()[-200:]
+    return retry(lambda: _send_email_once(mail_cfg, subject, body_text, body_html))
+
+
+PENDING_DIR = ROOT / "data" / "pending_mail"
+
+
+def save_pending_email(mail_cfg: dict, email: tuple[str, str, str]) -> Path:
+    """送れなかったメールを保存する。次回実行時に resend_pending_emails が再送する。"""
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    path = PENDING_DIR / f"{datetime.now(JST):%Y%m%d-%H%M%S}.json"
+    path.write_text(json.dumps(
+        {"subject": email[0], "body_text": email[1], "body_html": email[2], "mail_cfg": mail_cfg},
+        ensure_ascii=False,
+    ))
+    return path
+
+
+def resend_pending_emails(mail_cfg: dict) -> None:
+    """未送信のメールを古い順に再送する。成功したファイルは削除、失敗したら残す。"""
+    for path in sorted(PENDING_DIR.glob("*.json")) if PENDING_DIR.exists() else []:
+        try:
+            d = json.loads(path.read_text())
+            result = send_email(d.get("mail_cfg") or mail_cfg, d["subject"], d["body_text"], d["body_html"])
+            path.unlink()
+            log(f"未送信メール再送: {path.name} {result}")
+        except Exception as e:
+            log(f"未送信メール再送に失敗（残す）: {path.name}: {one_line(str(e), 200)}")
+            return
 
 
 # --- main ---
@@ -541,6 +593,11 @@ def main() -> None:
     cfg = load_config()
     KEYCHAIN_ACCOUNT = cfg.get("keychain_account") or KEYCHAIN_ACCOUNT
     db = open_db()
+    if not args.dry_run and cfg.get("mail", {}).get("enabled"):
+        try:
+            resend_pending_emails(cfg["mail"])
+        except Exception:
+            traceback.print_exc()
     run_id = db.execute("INSERT INTO runs (started_at, status) VALUES (?, 'running')", (now_iso(),)).lastrowid
     db.commit()
     stats = {"fetched": 0, "inserted": 0, "classified": 0, "passed": 0, "trends": 0}
@@ -619,11 +676,16 @@ def main() -> None:
                 log(f"メール送信: {','.join(mail_cfg['to'])} {result}")
             except Exception as e:
                 traceback.print_exc()
+                saved = save_pending_email(mail_cfg, email)
+                log(f"メールを保存した（次回再送）: {saved.name}")
                 finish("posted", error=f"{stage}: {e}", message_ids=message_ids)
-                post_discord(webhook, {
-                    "content": f"[x-tl-digest] {stage}で失敗した: {one_line(str(e), 300)}",
-                    "allowed_mentions": {"parse": []},
-                })
+                try:
+                    post_discord(webhook, {
+                        "content": f"[x-tl-digest] メール送信失敗: {one_line(str(e), 300)}。pending に保存（{saved.name}）",
+                        "allowed_mentions": {"parse": []},
+                    })
+                except Exception:
+                    traceback.print_exc()
     except Exception as e:
         traceback.print_exc()
         finish("failed", error=f"{stage}: {e}")

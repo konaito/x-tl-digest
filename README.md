@@ -52,7 +52,7 @@ The timeline is fetched by calling X's private API with the cookies of a logged-
 - A Discord webhook URL
 - The `cf` CLI, logged in with `cf auth login` to an account that can use Workers AI
 - The `claude` CLI (Claude Code), logged in
-- For email: [gog](https://gogcli.sh) (gogcli) and a Gmail account
+- For email: a mail-sending API (a Google Apps Script web app, see below)
 
 The prompts, the summaries, and the takes are in Japanese. To change the language, edit `SUMMARY_PROMPT` in `digest.py`.
 
@@ -70,7 +70,8 @@ Secrets go in the Keychain. The account name defaults to your login user name; s
 |---|---|
 | X cookies (JSON with `auth_token` and `ct0`) | `x-tl-digest.x-cookies` |
 | Discord webhook URL | `x-tl-digest.discord-webhook` |
-| Key for gog's encrypted file keyring (email only) | `x-tl-digest.gog-keyring` |
+| Mail-sending API URL (email only) | `claudecode-mail-proxy.url` |
+| Mail-sending API token (email only) | `claudecode-mail-proxy.token` |
 
 ```sh
 security add-generic-password -U -s x-tl-digest.x-cookies -a "$USER" \
@@ -83,17 +84,16 @@ You can find the cookies in DevTools while logged in to x.com. When they expire,
 
 ### Sending email
 
-gog's tokens are kept in an encrypted file, and only the key for that file goes in the Keychain. If gog used the Keychain directly, it would stop at a permission dialog when run from launchd.
+Email goes through a small mail-sending API: a Google Apps Script web app that you deploy yourself. It accepts `POST <URL>` with a JSON body `{"token","to","subject","html","text"}` and answers `{"ok":true,"messageId","from"}` or `{"ok":false,"error"}`. The sender address is fixed on the API side, and the API only accepts the recipients you allow. Because the web app sends as the account that deployed it, nothing in this repo holds a Google OAuth token, so there is no refresh token to expire.
+
+Put the API's URL and token in the Keychain:
 
 ```sh
-security add-generic-password -U -s x-tl-digest.gog-keyring -a "$USER" -w "$(openssl rand -hex 32)"
-export GOG_KEYRING_BACKEND=file
-export GOG_KEYRING_PASSWORD="$(security find-generic-password -s x-tl-digest.gog-keyring -a "$USER" -w)"
-gog auth credentials set client_secret.json   # an OAuth client created in Google Cloud
-gog auth add you@example.com --services gmail
+security add-generic-password -U -s claudecode-mail-proxy.url -a "$USER" -w 'https://script.google.com/macros/s/.../exec'
+security add-generic-password -U -s claudecode-mail-proxy.token -a "$USER" -w '...'
 ```
 
-Then set `enabled = true` under `[mail]` in `config.toml` and fill in `account` and `to`. To send from a different address, add it as a "Send mail as" address in Gmail settings (Accounts and Import) and put it in `from`. If that address's display name contains a comma, gog writes a broken From header and Gmail replaces it with your primary address.
+Then set `enabled = true` and `to` under `[mail]` in `config.toml`. Only an `ok: true` JSON response counts as sent. If sending fails (an `ok: false`, a non-JSON response, or a network error), the email is saved in `data/pending_mail/`, one line is posted to Discord, and the next run sends it again.
 
 ## Tuning
 

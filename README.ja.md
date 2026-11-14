@@ -52,7 +52,7 @@ x-tl-digest は、人間とAIエージェントの両方を読み手にしたメ
 - Discord の Webhook URL
 - `cf` CLI（`cf auth login` 済みで、Workers AI を使えるアカウント）
 - `claude` CLI（Claude Code。ログイン済み）
-- メールも送るなら [gog](https://gogcli.sh)（gogcli）と Gmail のアカウント
+- メールも送るなら、メール送信 API（Google Apps Script の Web アプリ。後述）
 
 ## セットアップ
 
@@ -68,7 +68,8 @@ cp config.example.toml config.toml
 |---|---|
 | X の cookie（`auth_token` と `ct0` の JSON） | `x-tl-digest.x-cookies` |
 | Discord Webhook URL | `x-tl-digest.discord-webhook` |
-| gog の暗号化ファイルの鍵（メールを送るときだけ） | `x-tl-digest.gog-keyring` |
+| メール送信 API の URL（メールを送るときだけ） | `claudecode-mail-proxy.url` |
+| メール送信 API の token（メールを送るときだけ） | `claudecode-mail-proxy.token` |
 
 ```sh
 security add-generic-password -U -s x-tl-digest.x-cookies -a "$USER" \
@@ -81,17 +82,16 @@ cookie は、x.com にログインしたブラウザの DevTools で確認でき
 
 ### メールも送るとき
 
-gog のトークンは暗号化ファイルに置き、その鍵を Keychain に入れる。gog に Keychain を直接使わせると、launchd から動かしたときに許可ダイアログで止まるため。
+メールは、自分でデプロイした Google Apps Script の Web アプリ（メール送信 API）に送らせる。`POST <URL>` に JSON `{"token","to","subject","html","text"}` を送ると、成功なら `{"ok":true,"messageId","from"}`、失敗なら `{"ok":false,"error"}` が返る。送信元は API 側で固定され、宛先も API 側が許したものだけ通る。送信はデプロイしたアカウントの権限で行われるので、このリポジトリ側に Google の OAuth トークンはなく、refresh token が切れることもない。
+
+API の URL と token を Keychain に入れる。
 
 ```sh
-security add-generic-password -U -s x-tl-digest.gog-keyring -a "$USER" -w "$(openssl rand -hex 32)"
-export GOG_KEYRING_BACKEND=file
-export GOG_KEYRING_PASSWORD="$(security find-generic-password -s x-tl-digest.gog-keyring -a "$USER" -w)"
-gog auth credentials set client_secret.json   # Google Cloud で作った OAuth クライアント
-gog auth add you@example.com --services gmail
+security add-generic-password -U -s claudecode-mail-proxy.url -a "$USER" -w 'https://script.google.com/macros/s/.../exec'
+security add-generic-password -U -s claudecode-mail-proxy.token -a "$USER" -w '...'
 ```
 
-そのうえで `config.toml` の `[mail]` を `enabled = true` にし、`account` と `to` を書く。別のアドレスから送るなら、Gmail の設定の「アカウントとインポート」でそのアドレスを送信元に登録し、`from` に書く。送信元の表示名にカンマがあると、gog が From ヘッダを壊し、Gmail が主アドレスに書き換える。
+そのうえで `config.toml` の `[mail]` を `enabled = true` にし、`to` を書く。送れたとみなすのは、JSON の `ok` が `true` の応答だけ。`ok: false`、JSON でない応答、通信エラーのいずれでも、メールは `data/pending_mail/` に保存され、Discord に1行の警告が出て、次回の実行で再送される。
 
 ## 調整
 
