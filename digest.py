@@ -1,10 +1,14 @@
 """XのおすすめTLから技術トレンドを拾い、Clef で絞り、claude -p で要約して Discord とメールで送る。
 
-launchd から 10:00 と 20:00 に1回ずつ起動する想定。設定は config.toml（config.example.toml を写して作る）。
+launchd から2種類の回を起動する想定。設定は config.toml（config.example.toml を写して作る）。
+
+- 取得だけの回（--collect）: 2時間おき。TL を取得して Clef で判定し、DB にためる。要約も送信もしない。
+- 送信の回（フラグなし）: 10:00 と 20:00。自分でも取得と判定を行い、前回の送信の回より後にたまった分を要約して送る。
 """
 
 import argparse
 import asyncio
+import fcntl
 import html
 import json
 import os
@@ -19,6 +23,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TextIO
 
 from twikit import Client
 
@@ -30,6 +35,16 @@ WEBHOOK_SERVICE = "x-tl-digest.discord-webhook"
 # メール送信 API（Google Apps Script の Web アプリ）の URL と token。リポジトリは公開なので値は Keychain にだけ置く。
 MAIL_URL_SERVICE = "claudecode-mail-proxy.url"
 MAIL_TOKEN_SERVICE = "claudecode-mail-proxy.token"
+
+# 同時実行を防ぐロックのファイル。launchd の2本のジョブや手動の実行が重なっても、動くのは1本だけにする。
+LOCK_PATH = ROOT / "data" / "digest.lock"
+# 送信の回は、先に走っている実行が終わるのをこの秒数まで待つ。取得だけの回は待たずに終わる。
+SEND_LOCK_WAIT_SEC = 600
+LOCK_POLL_SEC = 5
+# 取得だけの回の失敗がこの回数続いたら、その回に1回だけ Discord に警告を出す。
+COLLECT_FAIL_WARN_AT = 3
+# TL の取得がこの秒数で終わらなければ失敗にする。止まった取得がロックを持ち続けると、送信の回が動けなくなるため。
+FETCH_TIMEOUT_SEC = 300
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tweets (
@@ -160,6 +175,29 @@ def open_db() -> sqlite3.Connection:
     return db
 
 
+def acquire_lock(wait_sec: float) -> TextIO | None:
+    """同時実行を防ぐロックを取る。取れたらファイルを返し、wait_sec 秒待っても取れなければ None を返す。
+
+    ロックは LOCK_PATH への flock で、返したファイルを閉じるかプロセスが終わると外れる。
+    """
+    LOCK_PATH.parent.mkdir(exist_ok=True)
+    f = open(LOCK_PATH, "w")
+    deadline = time.monotonic() + wait_sec
+    waiting = False
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                f.close()
+                return None
+            if not waiting:
+                log(f"別の実行が終わるのを待つ（最大 {wait_sec:.0f} 秒）")
+                waiting = True
+            time.sleep(LOCK_POLL_SEC)
+
+
 # --- 取得 ---
 
 
@@ -218,6 +256,13 @@ async def fetch_timeline(fetch_cfg: dict, pages: int) -> list[dict]:
         except Exception as e:  # 削除済みや非公開の投稿が混ざっても、残りは処理する
             log(f"投稿 {getattr(t, 'id', '?')} を読めなかったので飛ばした: {e!r}")
     return rows
+
+
+async def fetch_timeline_within(fetch_cfg: dict, pages: int, timeout_sec: float) -> list[dict]:
+    try:
+        return await asyncio.wait_for(fetch_timeline(fetch_cfg, pages), timeout_sec)
+    except TimeoutError:
+        raise RuntimeError(f"{timeout_sec:g} 秒待っても終わらなかった") from None
 
 
 def insert_tweets(db: sqlite3.Connection, rows: list[dict]) -> int:
@@ -295,16 +340,57 @@ def classify(db: sqlite3.Connection, clef_cfg: dict) -> tuple[int, int]:
     return done, failed
 
 
-def select_candidates(db: sqlite3.Connection, clef_cfg: dict, summary_cfg: dict) -> list[sqlite3.Row]:
+def select_passed(db: sqlite3.Connection, clef_cfg: dict, summary_cfg: dict) -> list[sqlite3.Row]:
+    """しきい値を通り、まだどの送信の回にも使われていない投稿を、重要な順に全部返す。
+
+    要約に渡すのは先頭の max_candidates 件。取得だけの回がためた分も、lookback_hours 以内ならここに入る。
+    """
     since = (datetime.now(timezone.utc) - timedelta(hours=summary_cfg["lookback_hours"])).isoformat(timespec="seconds")
     return db.execute(
         """SELECT * FROM tweets
            WHERE digest_run IS NULL AND classified_at IS NOT NULL AND fetched_at >= ?
              AND p_tech >= ? AND p_worth >= ?
-           ORDER BY importance DESC, p_worth DESC
-           LIMIT ?""",
-        (since, clef_cfg["threshold_tech"], clef_cfg["threshold_worth"], summary_cfg["max_candidates"]),
+           ORDER BY importance DESC, p_worth DESC""",
+        (since, clef_cfg["threshold_tech"], clef_cfg["threshold_worth"]),
     ).fetchall()
+
+
+def consume(db: sqlite3.Connection, run_id: int, passed: list[sqlite3.Row]) -> None:
+    """送信の回が済んだら、しきい値を通った投稿を全部その回のものにする。
+
+    max_candidates で切られて要約に渡らなかった分も含める。次号に持ち越さない。
+    """
+    db.executemany("UPDATE tweets SET digest_run = ? WHERE id = ?", [(run_id, r["id"]) for r in passed])
+
+
+# --- runs テーブルの集計 ---
+
+
+def collection_totals(db: sqlite3.Connection, run_id: int, stats: dict) -> tuple[int, int, int]:
+    """前回の送信の回より後の、取得の回数・取得件数・新規件数を返す。この回の分（stats）も含める。
+
+    前回の送信の回は、この回より前で status が posted か skipped の最後の回。dry_run、classified_only、失敗した回は
+    境目にしないが、その回に取得した分は数える。取得しなかった回（--no-fetch、取得の失敗、途中で落ちた回）は数えない。
+    """
+    last_sent = db.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM runs WHERE id < ? AND status IN ('posted', 'skipped')", (run_id,)
+    ).fetchone()[0]
+    runs, fetched, inserted = db.execute(
+        """SELECT COUNT(*), COALESCE(SUM(fetched), 0), COALESCE(SUM(inserted), 0) FROM runs
+           WHERE id > ? AND id < ? AND fetched > 0""",
+        (last_sent, run_id),
+    ).fetchone()
+    if stats["fetched"]:
+        runs += 1
+    return runs, fetched + stats["fetched"], inserted + stats["inserted"]
+
+
+def collect_failure_streak(db: sqlite3.Connection) -> int:
+    """取得だけの回が、いま何回続けて失敗しているかを返す。最後に成功した取得だけの回より後の失敗を数える。"""
+    return db.execute(
+        """SELECT COUNT(*) FROM runs WHERE status = 'collect_failed'
+           AND id > COALESCE((SELECT MAX(id) FROM runs WHERE status = 'collected'), 0)"""
+    ).fetchone()[0]
 
 
 # --- claude -p で要約 ---
@@ -580,20 +666,91 @@ def resend_pending_emails(mail_cfg: dict) -> None:
 # --- main ---
 
 
+def fetch_and_classify(
+    db: sqlite3.Connection, cfg: dict, args: argparse.Namespace, stats: dict
+) -> list[tuple[str, str]]:
+    """TL を取得して Clef で判定する。失敗した段を（段の名前, 理由）の一覧で返す。
+
+    取得に失敗しても判定は行う。前の回に判定できなかった投稿が残っていることがあるため。
+    """
+    errors = []
+    if not args.no_fetch:
+        try:
+            pages = args.pages or cfg["fetch"]["pages"]
+            rows = asyncio.run(fetch_timeline_within(cfg["fetch"], pages, FETCH_TIMEOUT_SEC))
+            stats["fetched"] = len(rows)
+            stats["inserted"] = insert_tweets(db, rows)
+            log(f"TL取得: {stats['fetched']}件（新規 {stats['inserted']}件）")
+        except Exception as e:
+            traceback.print_exc()
+            errors.append(("TL取得", str(e) or type(e).__name__))
+    try:
+        stats["classified"], _ = classify(db, cfg["clef"])
+        log(f"Clef判定: {stats['classified']}件")
+    except Exception as e:
+        traceback.print_exc()
+        errors.append(("Clef判定", str(e) or type(e).__name__))
+    return errors
+
+
+def format_errors(errors: list[tuple[str, str]]) -> str:
+    """runs.error に残す形。"""
+    return "; ".join(f"{stage}: {reason}" for stage, reason in errors)
+
+
+def describe_errors(errors: list[tuple[str, str]]) -> str:
+    """Discord の1行の警告に書く形。"""
+    return " / ".join(f"{stage}で失敗した: {one_line(reason, 200)}" for stage, reason in errors)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--collect", action="store_true",
+                        help="取得だけの回。TL の取得と判定だけを行い、要約も送信もしない")
     parser.add_argument("--dry-run", action="store_true", help="Discord に送らず、送る内容を表示する")
     parser.add_argument("--no-fetch", action="store_true", help="TL を取得せず、DB にある分だけで処理する")
     parser.add_argument("--no-summary", action="store_true", help="判定までで止める（しきい値の調整用）")
     parser.add_argument("--pages", type=int, help="config.toml の fetch.pages を上書きする")
     parser.add_argument("--email-preview", type=Path, help="--dry-run のとき、メールの HTML をこのパスに書き出す")
     args = parser.parse_args()
+    if args.collect and (args.dry_run or args.no_summary or args.email_preview):
+        parser.error("--collect は --dry-run、--no-summary、--email-preview と一緒に使えない")
 
     global KEYCHAIN_ACCOUNT
     cfg = load_config()
     KEYCHAIN_ACCOUNT = cfg.get("keychain_account") or KEYCHAIN_ACCOUNT
+
+    def warn(text: str) -> None:
+        """Discord に1行の警告を送る。--dry-run では送らない。警告を送れなくても処理は止めない。"""
+        if args.dry_run:
+            return
+        try:
+            post_discord(keychain_get(WEBHOOK_SERVICE), {
+                "content": f"[x-tl-digest] {text}",
+                "allowed_mentions": {"parse": []},
+            })
+        except Exception:
+            traceback.print_exc()
+
+    # ロックは runs に行を作る前に取る。取れずに終わる回は runs に何も残さない。
+    lock = acquire_lock(0 if args.collect else SEND_LOCK_WAIT_SEC)
+    if lock is None:
+        if args.collect:
+            log("別の実行が進行中なので、取得だけの回は何もせずに終わる")
+            return
+        log(f"別の実行が {SEND_LOCK_WAIT_SEC} 秒待っても終わらないので、この回は何もせずに終わる")
+        warn(f"別の実行が {SEND_LOCK_WAIT_SEC} 秒待っても終わらないので、この回は何もせずに終えた")
+        sys.exit(1)
+    with lock:
+        kind = "取得だけの回" if args.collect else "判定までの回" if args.no_summary else "送信の回"
+        log(f"{kind}を始める" + ("（--dry-run）" if args.dry_run else ""))
+        run(args, cfg, warn)
+
+
+def run(args: argparse.Namespace, cfg: dict, warn) -> None:
     db = open_db()
-    if not args.dry_run and cfg.get("mail", {}).get("enabled"):
+    # 未送信メールの再送は送信の回だけが行う。取得だけの回は何も送らない。
+    if not args.collect and not args.dry_run and cfg.get("mail", {}).get("enabled"):
         try:
             resend_pending_emails(cfg["mail"])
         except Exception:
@@ -611,27 +768,51 @@ def main() -> None:
         )
         db.commit()
 
-    stage = "TL取得"
+    def fail(errors: list[tuple[str, str]]) -> None:
+        """この回を失敗として記録し、終了コード 1 で終わる。
+
+        送信の回は毎回 Discord に警告を出す。取得だけの回は、失敗が COLLECT_FAIL_WARN_AT 回続いた回にだけ出す。
+        """
+        if args.collect:
+            finish("collect_failed", error=format_errors(errors))
+            streak = collect_failure_streak(db)
+            log(f"取得だけの回が失敗した（{streak}回連続）: {one_line(format_errors(errors), 300)}")
+            if streak == COLLECT_FAIL_WARN_AT:
+                warn(f"取得だけの回が{streak}回続けて失敗した。次に成功するまで、この警告は出さない。{describe_errors(errors)}")
+        else:
+            finish("failed", error=format_errors(errors))
+            warn(describe_errors(errors))
+        sys.exit(1)
+
+    errors: list[tuple[str, str]] = []
+    stage = "TL取得とClef判定"
     try:
-        if not args.no_fetch:
-            rows = asyncio.run(fetch_timeline(cfg["fetch"], args.pages or cfg["fetch"]["pages"]))
-            stats["fetched"] = len(rows)
-            stats["inserted"] = insert_tweets(db, rows)
-            log(f"TL取得: {stats['fetched']}件（新規 {stats['inserted']}件）")
+        errors += fetch_and_classify(db, cfg, args, stats)
 
-        stage = "Clef判定"
-        stats["classified"], _ = classify(db, cfg["clef"])
-        log(f"Clef判定: {stats['classified']}件")
-
-        candidates = select_candidates(db, cfg["clef"], cfg["summary"])
-        stats["passed"] = len(candidates)
-        log(f"判定通過: {stats['passed']}件")
+        stage = "候補の選択"
+        passed = select_passed(db, cfg["clef"], cfg["summary"])
+        stats["passed"] = len(passed)
+        log(f"判定通過: {stats['passed']}件（まだ送っていない分の合計）")
+        if args.collect:
+            if errors:
+                fail(errors)
+            finish("collected")
+            log("取得だけの回を終えた（要約と送信はしない）")
+            return
         if args.no_summary:
+            if errors:
+                fail(errors)
             finish("classified_only")
             return
+
+        # ここから先は送信の回。取得や判定に失敗していても、DB にたまっている判定済みの分があれば要約と送信まで進む。
+        # dry-run は posted と skipped を書かない。この2つは「前回の送信の回」の境目になるため。
+        candidates = passed[: cfg["summary"]["max_candidates"]]
         if not candidates:
+            if errors:
+                fail(errors)
             log("候補がないので送らない")
-            finish("skipped")
+            finish("dry_run" if args.dry_run else "skipped")
             return
 
         stage = "claude -p 要約"
@@ -639,20 +820,29 @@ def main() -> None:
         stats["trends"] = len(trends)
         log(f"トレンド: {stats['trends']}件")
         if not trends:
-            if not args.dry_run:
-                db.executemany("UPDATE tweets SET digest_run = ? WHERE id = ?", [(run_id, r["id"]) for r in candidates])
             log("まとめるトレンドがないので送らない")
-            finish("skipped")
+            if args.dry_run:
+                finish("dry_run", error=format_errors(errors) or None)
+                return
+            consume(db, run_id, passed)
+            finish("skipped", error=format_errors(errors) or None)
+            if errors:
+                # ダイジェストを送らない回なので、取得や判定の失敗は1行の警告で知らせる。
+                warn(describe_errors(errors))
             return
 
         stage = "Discord送信"
-        header = (
-            f"**XおすすめTLの技術トレンド** {datetime.now(JST):%m/%d %H:%M}\n"
-            f"取得 {stats['fetched']}件（新規 {stats['inserted']}件）→ 判定通過 {stats['passed']}件 → {stats['trends']}トピック"
-        )
+        runs, fetched, inserted = collection_totals(db, run_id, stats)
+        passed_text = f"判定通過 {len(passed)}件 "
+        if len(passed) > len(candidates):
+            passed_text = f"判定通過 {len(passed)}件（上位 {len(candidates)}件を要約）"
+        stats_line = f"取得 {runs}回・{fetched}件（新規 {inserted}件）→ {passed_text}→ {stats['trends']}トピック"
+        header = f"**XおすすめTLの技術トレンド** {datetime.now(JST):%m/%d %H:%M}\n{stats_line}"
+        # 取得や判定の失敗は Discord のヘッダにだけ書く。メールには入れない。
+        for failed_stage, reason in errors:
+            header += f"\n[警告] 今回の{failed_stage}に失敗したので、たまっていた分だけで作った: {one_line(reason, 200)}"
         row_map = {r["id"]: r for r in candidates}
         messages = build_messages(header, trends, row_map)
-        stats_line = header.split("\n", 1)[1]
         mail_cfg = cfg.get("mail", {})
         email = build_email(trends, row_map, stats_line) if mail_cfg.get("enabled") else None
         if args.dry_run:
@@ -660,12 +850,12 @@ def main() -> None:
             if email and args.email_preview:
                 args.email_preview.write_text(email[2])
                 log(f"メールの件名: {email[0]} / HTML: {args.email_preview}")
-            finish("dry_run")
+            finish("dry_run", error=format_errors(errors) or None)
             return
         webhook = keychain_get(WEBHOOK_SERVICE)
         message_ids = post_messages(webhook, messages)
-        db.executemany("UPDATE tweets SET digest_run = ? WHERE id = ?", [(run_id, r["id"]) for r in candidates])
-        finish("posted", message_ids=message_ids)
+        consume(db, run_id, passed)
+        finish("posted", error=format_errors(errors) or None, message_ids=message_ids)
         log(f"Discord送信: message_id={','.join(message_ids)}")
 
         if email:
@@ -678,26 +868,11 @@ def main() -> None:
                 traceback.print_exc()
                 saved = save_pending_email(mail_cfg, email)
                 log(f"メールを保存した（次回再送）: {saved.name}")
-                finish("posted", error=f"{stage}: {e}", message_ids=message_ids)
-                try:
-                    post_discord(webhook, {
-                        "content": f"[x-tl-digest] メール送信失敗: {one_line(str(e), 300)}。pending に保存（{saved.name}）",
-                        "allowed_mentions": {"parse": []},
-                    })
-                except Exception:
-                    traceback.print_exc()
+                finish("posted", error=format_errors(errors + [(stage, str(e))]), message_ids=message_ids)
+                warn(f"メール送信失敗: {one_line(str(e), 300)}。pending に保存（{saved.name}）")
     except Exception as e:
         traceback.print_exc()
-        finish("failed", error=f"{stage}: {e}")
-        if not args.dry_run:
-            try:
-                post_discord(keychain_get(WEBHOOK_SERVICE), {
-                    "content": f"[x-tl-digest] {stage}で失敗した: {one_line(str(e), 300)}",
-                    "allowed_mentions": {"parse": []},
-                })
-            except Exception:
-                traceback.print_exc()
-        sys.exit(1)
+        fail(errors + [(stage, str(e) or type(e).__name__)])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 English | [日本語](README.ja.md)
 
-x-tl-digest picks up tech trends from your X "For you" timeline and sends summaries, along with the AI's own take, to Discord and as an email newsletter. On macOS, launchd runs it twice a day, at 10:00 and 20:00.
+x-tl-digest picks up tech trends from your X "For you" timeline and sends summaries, along with the AI's own take, to Discord and as an email newsletter. On macOS, launchd fetches the timeline every two hours and sends a digest twice a day, at 10:00 and 20:00.
 
 ## The era of humans reading newsletters is over
 
@@ -32,13 +32,35 @@ This repository stops short of that. The AI writes its take, but nothing here ex
 
 ## How it works
 
+launchd starts two kinds of runs.
+
+- A collect run (`--collect`) starts at 0:00, 2:00, 4:00, 6:00, 8:00, 12:00, 14:00, 16:00, 18:00, and 22:00. It does steps 1 to 3 below and keeps the classified posts in the database. It does not summarize or send anything.
+- A send run (no flag) starts at 10:00 and 20:00. It does steps 1 to 7 and builds the digest from the posts collected since the previous send run.
+
 1. Fetches 5 pages of the "For you" timeline with [twifork](https://github.com/PawiX25/twifork) (a maintained fork of twikit), using your cookies.
 2. Stores the posts in `data/digest.sqlite`. Retweets are collapsed into the original post.
 3. Classifies each post with Clef on Cloudflare Workers AI (`@cf/cloudflare/clef`): is it about tech, is it worth the reader's attention, and how important is it.
-4. Passes the posts above the thresholds to `claude -p`, which writes a summary and a take for each trend.
+4. Passes the posts that are above the thresholds and not sent yet to `claude -p`, most important first, up to `max_candidates`. `claude -p` writes a summary and a take for each trend.
 5. Sends each trend to Discord with its summary, the AI's take, key posts, and external URLs you can load into NotebookLM. Nothing is sent when there are no candidates.
 6. If `[mail]` is enabled, sends the same content as an HTML email.
-7. If fetching or classification fails, posts a one-line warning to Discord.
+7. Marks every post above the thresholds as sent. Posts beyond `max_candidates`, which were not passed to the summary, are not carried over to the next digest either.
+
+The digest header shows the totals of all fetches since the previous send run. For example (the header itself is in Japanese):
+
+```
+取得 6回・512件（新規 401件）→ 判定通過 48件 → 7トピック
+```
+
+This reads: 6 fetches, 512 posts (401 new), 48 above the thresholds, 7 topics.
+
+More fetches mean more posts for Clef to classify, at roughly the same rate. Choose the number of collect runs with your Workers AI usage in mind.
+
+### When something fails
+
+- A send run keeps going when fetching or classification fails. It summarizes and sends the classified posts already in the database, and the reason for the failure appears as one line in the Discord header. If the database has nothing to send either, it posts a one-line warning to Discord and stops.
+- When the summary or the Discord post fails in a send run, it posts a one-line warning to Discord. The posts are not marked as sent, so the next send run picks them up again.
+- A failed collect run is recorded in the `runs` table and the log. A warning goes to Discord only once, when collect runs have failed three times in a row. It is not repeated until a collect run succeeds again.
+- When two runs overlap, a lock (`data/digest.lock`) makes them run one at a time. A collect run exits without doing anything if another run is in progress. A send run waits up to 10 minutes for the other run to finish.
 
 ## Caution
 
@@ -114,20 +136,49 @@ uv run digest.py              # same as the scheduled run
 uv run digest.py --dry-run    # print what would be sent, without sending
 uv run digest.py --dry-run --email-preview mail.html   # also write the email HTML
 uv run digest.py --no-fetch   # skip fetching; use only what is already in the DB
+uv run digest.py --collect    # collect run: fetch and classify only, send nothing
 ```
 
 ## Scheduling
 
-`install-launchd.sh` fills in the paths in `launchd/x-tl-digest.plist` and registers it in `~/Library/LaunchAgents`. Run it again whenever you change the plist. The label defaults to `local.x-tl-digest`; set the `LABEL` environment variable to change it.
+`install-launchd.sh` fills in the paths in the two plists under `launchd/` and registers them in `~/Library/LaunchAgents`. Run it again whenever you change a plist.
+
+| Job | plist | Label | Starts at |
+|---|---|---|---|
+| Send run | `launchd/x-tl-digest.plist` | `local.x-tl-digest` | 10:00, 20:00 |
+| Collect run | `launchd/x-tl-digest-collect.plist` | `local.x-tl-digest-collect` | 0:00, 2:00, 4:00, 6:00, 8:00, 12:00, 14:00, 16:00, 18:00, 22:00 |
+
+Set the `LABEL` environment variable to change the `local.x-tl-digest` part of the labels.
 
 ```sh
 ./install-launchd.sh
-launchctl kickstart gui/$(id -u)/local.x-tl-digest   # run once right now
+launchctl kickstart gui/$(id -u)/local.x-tl-digest           # start a send run right now
+launchctl kickstart gui/$(id -u)/local.x-tl-digest-collect   # start a collect run right now
 ```
+
+To change how often the timeline is fetched, edit `StartCalendarInterval` in `launchd/x-tl-digest-collect.plist` and register it again. Leave 10:00 and 20:00 out of the collect job, because the send run fetches at those times.
 
 When running under launchd, keep the repository outside `~/Documents`. Inside it, uv started by launchd stops at a dialog asking for access to the Documents folder.
 
-Logs go to `logs/digest.log`. Per-run counts and Discord message IDs are recorded in the `runs` table.
+Both jobs log to `logs/digest.log`. Per-run counts and Discord message IDs are recorded in the `runs` table. The `status` column of `runs` means the following.
+
+| status | Meaning |
+|---|---|
+| `posted` | A send run posted to Discord |
+| `skipped` | A send run had no candidates or no trends, so it sent nothing |
+| `failed` | A send run or a `--no-summary` run failed |
+| `collected` | A collect run finished |
+| `collect_failed` | A collect run failed |
+| `dry_run` | Run with `--dry-run` |
+| `classified_only` | Run with `--no-summary` |
+
+## Tests
+
+```sh
+uv run --with pytest pytest
+```
+
+The tests replace everything that reaches outside (X, Clef, `claude -p`, Discord, email, the Keychain) with fakes and create the database in a temporary directory. Nothing is sent to the real Discord or by email.
 
 ## License
 

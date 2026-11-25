@@ -2,7 +2,7 @@
 
 [English](README.md) | 日本語
 
-X のおすすめTLから技術トレンドを拾い、要約とAIの所感を Discord とメルマガで送る。macOS の launchd が毎日10時と20時に1回ずつ起動する。
+X のおすすめTLから技術トレンドを拾い、要約とAIの所感を Discord とメルマガで送る。macOS の launchd が2時間おきにTLを取得し、毎日10時と20時にまとめて送る。
 
 ## 人間がメルマガを読む時代は終わった
 
@@ -32,13 +32,33 @@ x-tl-digest は、人間とAIエージェントの両方を読み手にしたメ
 
 ## 処理の流れ
 
+launchd は2種類の回を起動する。
+
+- 取得だけの回（`--collect`）は、0・2・4・6・8・12・14・16・18・22時に動く。下の1〜3を行い、判定した投稿を DB にためる。要約も送信もしない。
+- 送信の回（フラグなし）は、10時と20時に動く。下の1〜7を行い、前回の送信の回より後にたまった投稿からダイジェストを作る。
+
 1. [twifork](https://github.com/PawiX25/twifork)（twikit の保守フォーク）で、cookie を使っておすすめTLを5ページ取得する。
 2. 取得した投稿を `data/digest.sqlite` に保存する。RT は元ツイートとして1件にまとめる。
 3. Cloudflare Workers AI の Clef（`@cf/cloudflare/clef`）で、1件ずつ「技術の話か」「読み手が理解しておくべきか」「重要度」を判定する。
-4. しきい値を超えた投稿を `claude -p` に渡し、トレンドごとに要約と所感を書かせる。
+4. しきい値を超えてまだ送っていない投稿を、重要度の高い順に `max_candidates` 件まで `claude -p` に渡し、トレンドごとに要約と所感を書かせる。
 5. Discord に、トレンドごとの要約、AIの所感、主要ツイート、NotebookLM に入れられる外部URLを送る。候補が0件なら送らない。
 6. `[mail]` を有効にしていれば、同じ内容を HTML メールで送る。
-7. 取得や判定に失敗したときは、Discord に1行の警告を送る。
+7. しきい値を超えた投稿を全部、送信済みにする。`max_candidates` を超えて要約に渡さなかった投稿も、次号には持ち越さない。
+
+ダイジェストのヘッダには、前回の送信の回より後の取得を合算した件数が出る。次はその例である。
+
+```
+取得 6回・512件（新規 401件）→ 判定通過 48件 → 7トピック
+```
+
+取得の回数を増やすと、Clef で判定する投稿もほぼ同じ割合で増える。Workers AI の利用量を見て回数を決めてほしい。
+
+### 失敗したとき
+
+- 送信の回は、TL の取得や判定に失敗しても、DB にたまっている判定済みの投稿で要約と送信まで進む。失敗の理由は Discord のヘッダに1行で出る。たまっている投稿も無いときは、Discord に1行の警告を送って終わる。
+- 送信の回の要約か Discord への送信が失敗したときは、Discord に1行の警告を送る。投稿を送信済みにしないので、次の送信の回が同じ投稿を拾う。
+- 取得だけの回の失敗は、`runs` テーブルとログに残る。Discord への警告は、取得だけの回の失敗が3回続いたときに1回だけ送る。次に成功するまで、同じ警告は送らない。
+- 2本の実行が重なったときは、ロック（`data/digest.lock`）で1本ずつ動かす。取得だけの回は、ほかの実行が動いていれば何もせずに終わる。送信の回は、ほかの実行が終わるのを10分まで待つ。
 
 ## 注意
 
@@ -112,20 +132,49 @@ uv run digest.py              # 本番と同じ処理
 uv run digest.py --dry-run    # 送らずに、送る内容を表示する
 uv run digest.py --dry-run --email-preview mail.html   # メールの HTML も書き出す
 uv run digest.py --no-fetch   # TL を取得せず、DB にある分だけで処理する
+uv run digest.py --collect    # 取得だけの回。取得と判定だけを行い、何も送らない
 ```
 
 ## 定期実行
 
-`install-launchd.sh` が `launchd/x-tl-digest.plist` のパスを置き換えて `~/Library/LaunchAgents` に登録する。plist を変えたときも同じスクリプトで登録し直す。ラベルの既定は `local.x-tl-digest` で、環境変数 `LABEL` で変えられる。
+`install-launchd.sh` が `launchd/` にある2本の plist のパスを置き換えて `~/Library/LaunchAgents` に登録する。plist を変えたときも同じスクリプトで登録し直す。
+
+| ジョブ | plist | ラベル | 起動する時刻 |
+|---|---|---|---|
+| 送信の回 | `launchd/x-tl-digest.plist` | `local.x-tl-digest` | 10時、20時 |
+| 取得だけの回 | `launchd/x-tl-digest-collect.plist` | `local.x-tl-digest-collect` | 0・2・4・6・8・12・14・16・18・22時 |
+
+ラベルの `local.x-tl-digest` の部分は、環境変数 `LABEL` で変えられる。
 
 ```sh
 ./install-launchd.sh
-launchctl kickstart gui/$(id -u)/local.x-tl-digest   # すぐに1回動かす
+launchctl kickstart gui/$(id -u)/local.x-tl-digest           # 送信の回をすぐに1回動かす
+launchctl kickstart gui/$(id -u)/local.x-tl-digest-collect   # 取得だけの回をすぐに1回動かす
 ```
+
+取得の回数を変えるときは、`launchd/x-tl-digest-collect.plist` の `StartCalendarInterval` を書き換えて登録し直す。10時と20時は送信の回が取得するので、取得だけの回には入れない。
 
 launchd で動かすときは、リポジトリを `~/Documents` の外に置く。`~/Documents` の中に置くと、launchd から起動した uv が書類フォルダへのアクセス許可を求めるダイアログで止まる。
 
-ログは `logs/digest.log` に出る。実行ごとの件数と Discord の message_id は `runs` テーブルに残る。
+ログは2本とも `logs/digest.log` に出る。実行ごとの件数と Discord の message_id は `runs` テーブルに残る。`runs` の `status` は次の意味である。
+
+| status | 意味 |
+|---|---|
+| `posted` | 送信の回が Discord に送った |
+| `skipped` | 送信の回が、候補かトレンドが無いので送らなかった |
+| `failed` | 送信の回か `--no-summary` の実行が失敗した |
+| `collected` | 取得だけの回が済んだ |
+| `collect_failed` | 取得だけの回が失敗した |
+| `dry_run` | `--dry-run` で実行した |
+| `classified_only` | `--no-summary` で実行した |
+
+## テスト
+
+```sh
+uv run --with pytest pytest
+```
+
+テストは、外へ出る処理（X、Clef、`claude -p`、Discord、メール、Keychain）をにせものに差し替え、DB を一時ディレクトリに作る。本物の Discord とメールには何も送らない。
 
 ## ライセンス
 
