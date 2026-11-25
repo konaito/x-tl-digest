@@ -7,3 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     "twifork[impersonate]>=2.4.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# twifork が使う js2py が、読み込みのたびに出す警告。テストの結果と関係がないので出さない。
+filterwarnings = ["ignore::DeprecationWarning:js2py_.*"]

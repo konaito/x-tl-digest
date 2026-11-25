@@ -5,7 +5,7 @@
 # keychain_account = ""
 
 [fetch]
-# おすすめTLを何ページ取るか。1ページはおよそ20件。
+# おすすめTLを何ページ取るか。1ページはおよそ20件。取得だけの回も送信の回も、1回にこのページ数を取る。
 pages = 5
 count = 20
 page_interval_sec = 3
@@ -47,9 +47,11 @@ criteria = [
 [summary]
 # 空なら claude の既定モデルを使う。
 model = ""
-max_candidates = 60
+# 1回の送信で要約に渡す投稿の上限。しきい値を通った投稿がこれより多ければ、重要度の高い順にこの件数まで渡す。
+# 渡さなかった分も次号には持ち越さない。
+max_candidates = 100
 max_trends = 8
-# これより前に取得した候補は送らない。
+# これより前に取得した候補は送らない。取得だけの回がためた分も、この時間内なら送信の回の候補になる。
 lookback_hours = 36
 # 読み手の説明。要約とAIの所感はこの読み手に向けて書かれる。自分に合わせて書き換える。
 profile = "日本のインディー開発者・スタートアップ創業者。Next.js、Cloudflare Workers、Supabase、iOS/Android でアプリを作り、開発の大半を Claude Code や Codex などのAIコーディングエージェントで進め、LLMを使ったプロダクトを作っている。"
