@@ -128,7 +128,7 @@ sqlite3 -header -column data/digest.sqlite \
 ## 手動実行
 
 ```sh
-uv run digest.py              # 本番と同じ処理
+uv run digest.py              # 送信の回と同じ処理
 uv run digest.py --dry-run    # 送らずに、送る内容を表示する
 uv run digest.py --dry-run --email-preview mail.html   # メールの HTML も書き出す
 uv run digest.py --no-fetch   # TL を取得せず、DB にある分だけで処理する

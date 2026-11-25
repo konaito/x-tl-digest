@@ -132,7 +132,7 @@ sqlite3 -header -column data/digest.sqlite \
 ## Running manually
 
 ```sh
-uv run digest.py              # same as the scheduled run
+uv run digest.py              # same as a scheduled send run
 uv run digest.py --dry-run    # print what would be sent, without sending
 uv run digest.py --dry-run --email-preview mail.html   # also write the email HTML
 uv run digest.py --no-fetch   # skip fetching; use only what is already in the DB
